@@ -213,6 +213,9 @@ canvas{position:absolute;top:0;left:0;width:100%;height:100%}
     <div class="grow"><span class="ge">👆</span><span><b>Swipe L / R</b> = Color</span></div>
     <div class="grow"><span class="ge">🤏</span><span><b>Pinch in / out</b> = Size</span></div>
     <div class="grow"><span class="ge">✋</span><span><b>Open hand</b> = Undo</span></div>
+    <span class="gsec">Mouth (Face)</span>
+    <div class="grow"><span class="ge">😮</span><span><b>Open mouth</b> = Eat/Erase</span></div>
+    <div class="grow"><span class="ge">😗</span><span><b>Pucker lips</b> = Spit ink</span></div>
     <span class="gsec">Face Filters</span>
     <div class="grow"><span class="ge">☝️</span><span>Select from top bar ↑</span></div>
   </div>
@@ -236,6 +239,13 @@ let cidx = 0, brushSz = 6, filter = 'none', hist = [];
 let px = null, py = null, drawing = false;
 let cPrevX = null, cSwipeLock = false, cPinchPrev = null, cOpenLast = false;
 let faceLMs = null, frame = 0;
+
+// ── Mouth state ──
+let mouthWasOpen  = false;   // for eat edge detection
+let mouthWasPucker= false;   // for spit edge detection
+let eatParticles  = [];      // chomping particles
+let spitDrops     = [];      // spit/throw ink drops
+let spitReady     = false;   // spit armed after eating
 
 /* ════════ DOM ════════ */
 const webcam = document.getElementById('webcam');
@@ -545,19 +555,216 @@ handsMP.onResults(res=>{
     sTxt.textContent='2-hand mode active';
   }
   renderFace();
+  updateParticles();
 });
+
+/* ════════ MOUTH DETECTION ════════ */
+// FaceMesh landmarks:
+//  13 = upper inner lip,  14 = lower inner lip  → vertical gap = open
+//  61 = left mouth corner, 291 = right mouth corner → horizontal width
+//  0  = nose tip (for pucker reference)
+
+function getMouthMetrics(lms, W, H) {
+  const fp = i => ({ x: (1-lms[i].x)*W, y: lms[i].y*H });
+  const upper = fp(13), lower = fp(14);
+  const left  = fp(61),  right = fp(291);
+  const mw = Math.hypot(right.x-left.x, right.y-left.y);   // mouth width
+  const mo = Math.hypot(upper.x-lower.x, upper.y-lower.y); // mouth open height
+  const ratio = mo / (mw || 1); // open ratio: >0.35 = open, <0.12 = pucker
+  const cx = (left.x+right.x)/2, cy = (upper.y+lower.y)/2;
+  return { ratio, cx, cy, mw, mo, upper, lower, left, right };
+}
+
+/* ── EAT: open mouth erases drawing around mouth position ── */
+function applyMouthEat(m) {
+  const isOpen = m.ratio > 0.30;
+
+  if (isOpen) {
+    // Erase a circle around the mouth on draw canvas
+    const r = m.mw * 0.7; // radius ~ mouth width
+    xDr.globalCompositeOperation = 'destination-out';
+    // Chomp effect: irregular erase
+    xDr.beginPath();
+    xDr.arc(m.cx, m.cy, r, 0, Math.PI*2);
+    xDr.fill();
+    xDr.globalCompositeOperation = 'source-over';
+
+    // Spawn eat particles (chomping crumbs)
+    if (!mouthWasOpen) {
+      // Big chomp on first open
+      for (let i = 0; i < 18; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = 1.5 + Math.random() * 4;
+        eatParticles.push({
+          x: m.cx + (Math.random()-0.5)*r,
+          y: m.cy + (Math.random()-0.5)*r*0.5,
+          vx: Math.cos(angle)*speed,
+          vy: Math.sin(angle)*speed - 2,
+          life: 1.0,
+          size: 3 + Math.random()*6,
+          color: COLORS[cidx],
+        });
+      }
+      flash2('NOM NOM 😮', '#fb923c');
+      spitReady = true; // arm the spit
+    } else {
+      // Continuous small crumbs
+      if (Math.random() < 0.4) {
+        eatParticles.push({
+          x: m.cx + (Math.random()-0.5)*r,
+          y: m.cy + (Math.random()-0.5)*r*0.5,
+          vx: (Math.random()-0.5)*3,
+          vy: -1 - Math.random()*2,
+          life: 0.8,
+          size: 2 + Math.random()*4,
+          color: COLORS[cidx],
+        });
+      }
+    }
+    mouthWasOpen = true;
+
+    // Draw mouth indicator on UI
+    xUI.beginPath();
+    xUI.arc(m.cx, m.cy, r, 0, Math.PI*2);
+    xUI.setLineDash([6,4]);
+    xUI.strokeStyle = 'rgba(251,146,60,0.7)';
+    xUI.lineWidth = 2.5;
+    xUI.stroke();
+    xUI.setLineDash([]);
+    // teeth lines (fun indicator)
+    xUI.fillStyle = 'rgba(251,146,60,0.25)';
+    xUI.fill();
+
+  } else {
+    mouthWasOpen = false;
+  }
+}
+
+/* ── SPIT: pucker lips → throw ink splatter in face direction ── */
+function applyMouthSpit(m) {
+  const isPucker = m.ratio < 0.10 && m.mw < cBG.width * 0.10;
+  // Spit only triggers if we ate something first (spitReady)
+  if (isPucker && !mouthWasPucker && spitReady) {
+    // Splatter: lots of drops flying from mouth toward left (mirrored = right on screen)
+    const spitCount = 24 + Math.floor(Math.random()*16);
+    const baseAngle = -0.1; // mostly horizontal, slight variations
+    for (let i = 0; i < spitCount; i++) {
+      const spread = (Math.random()-0.5) * 1.2; // angle spread
+      const angle  = baseAngle + spread;
+      const speed  = 4 + Math.random() * 12;
+      const size   = 2 + Math.random() * (brushSz * 0.8);
+      spitDrops.push({
+        x: m.cx,
+        y: m.cy + (Math.random()-0.5)*m.mo,
+        vx: Math.cos(angle) * speed * (Math.random() > 0.5 ? 1 : -1), // both directions
+        vy: Math.sin(angle) * speed - Math.random()*3,
+        life: 1.0,
+        decay: 0.015 + Math.random()*0.02,
+        size,
+        color: COLORS[cidx],
+        splat: false,
+      });
+    }
+    flash2('💦 SPIT!', COLORS[cidx]);
+    spitReady = false;
+    mouthWasPucker = true;
+  } else if (!isPucker) {
+    mouthWasPucker = false;
+  }
+}
+
+/* ── UPDATE & DRAW PARTICLES ── */
+function updateParticles() {
+  // Eat crumbs
+  for (let i = eatParticles.length-1; i >= 0; i--) {
+    const p = eatParticles[i];
+    p.x += p.vx; p.y += p.vy;
+    p.vy += 0.18; // gravity
+    p.life -= 0.04;
+    if (p.life <= 0) { eatParticles.splice(i,1); continue; }
+    xUI.globalAlpha = p.life;
+    xUI.beginPath();
+    xUI.arc(p.x, p.y, p.size*p.life, 0, Math.PI*2);
+    xUI.fillStyle = p.color;
+    xUI.fill();
+    xUI.globalAlpha = 1;
+  }
+
+  // Spit drops — they paint on draw canvas when they land
+  for (let i = spitDrops.length-1; i >= 0; i--) {
+    const d = spitDrops[i];
+    d.x += d.vx; d.y += d.vy;
+    d.vy += 0.25; // gravity
+    d.vx *= 0.97; // air resistance
+    d.life -= d.decay;
+
+    // Splat when drop slows down or reaches canvas edge
+    const offscreen = d.x<0||d.x>cBG.width||d.y<0||d.y>cBG.height;
+    const slow = Math.abs(d.vx)<0.5 && Math.abs(d.vy)<0.5;
+
+    if (d.life <= 0 || offscreen) {
+      spitDrops.splice(i,1); continue;
+    }
+
+    if (slow && !d.splat) {
+      // Paint a splat on draw canvas
+      d.splat = true;
+      xDr.globalCompositeOperation = 'source-over';
+      xDr.beginPath();
+      xDr.arc(d.x, d.y, d.size*1.4, 0, Math.PI*2);
+      xDr.fillStyle = d.color;
+      xDr.fill();
+      // Add spiky splat legs
+      for (let j=0;j<6;j++) {
+        const a = (j/6)*Math.PI*2+Math.random()*.5;
+        const len = d.size*(1.5+Math.random()*2);
+        xDr.beginPath();
+        xDr.moveTo(d.x,d.y);
+        xDr.lineTo(d.x+Math.cos(a)*len, d.y+Math.sin(a)*len);
+        xDr.strokeStyle=d.color;
+        xDr.lineWidth=Math.max(1,d.size*0.4);
+        xDr.lineCap='round';
+        xDr.stroke();
+      }
+      spitDrops.splice(i,1); continue;
+    }
+
+    // Draw flying drop on UI canvas
+    xUI.globalAlpha = d.life * 0.9;
+    xUI.beginPath();
+    // Teardrop shape: elongate in direction of travel
+    xUI.arc(d.x, d.y, d.size*(0.5+d.life*0.5), 0, Math.PI*2);
+    xUI.fillStyle = d.color;
+    xUI.fill();
+    xUI.globalAlpha = 1;
+  }
+}
 
 /* ════════ FACE MESH ════════ */
 const faceMP=new FaceMesh({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`});
 faceMP.setOptions({maxNumFaces:1,refineLandmarks:false,minDetectionConfidence:.6,minTrackingConfidence:.55});
-faceMP.onResults(r=>{faceLMs=r.multiFaceLandmarks?.[0]||null});
+faceMP.onResults(r=>{
+  faceLMs=r.multiFaceLandmarks?.[0]||null;
+  // Process mouth every frame
+  if (faceLMs) {
+    const W=cBG.width, H=cBG.height;
+    const m = getMouthMetrics(faceLMs, W, H);
+    applyMouthEat(m);
+    applyMouthSpit(m);
+    // Also render face filter here
+    renderFace();
+  } else {
+    xFc.clearRect(0,0,cFc.width,cFc.height);
+  }
+});
 
 /* ════════ CAMERA ════════ */
 const cam=new Camera(webcam,{
   onFrame:async()=>{
     frame++;
     await handsMP.send({image:webcam});
-    if(filter!=='none'&&frame%3===0) await faceMP.send({image:webcam});
+    // Always run face mesh (mouth + filters) every 2nd frame
+    if(frame%2===0) await faceMP.send({image:webcam});
   },
   width:1280,height:720
 });
